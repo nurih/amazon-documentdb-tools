@@ -1,16 +1,16 @@
 #!/bin/env python
 """
   Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-  
+
   Licensed under the Apache License, Version 2.0 (the "License").
   You may not use this file except in compliance with the License.
   A copy of the License is located at
-  
+
       http://www.apache.org/licenses/LICENSE-2.0
-  
-  or in the "license" file accompanying this file. This file is distributed 
-  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either 
-  express or implied. See the License for the specific language governing 
+
+  or in the "license" file accompanying this file. This file is distributed
+  on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
+  express or implied. See the License for the specific language governing
   permissions and limitations under the License.
 """
 
@@ -131,7 +131,7 @@ class DocumentDbIndexTool(IndexToolConstants):
             else:
                 raise
 
-    def _get_db_connection(self, host, port, tls, tls_ca_file, username,
+    def _get_db_connection(self, host, port, tls, tls_ca_file, tls_client_file, tls_pem_passphrase, username,
                            password, auth_db):
         """Connect to instance, returning a connection"""
         logging.debug("Connecting to instance at %s:%s", host, port)
@@ -141,6 +141,8 @@ class DocumentDbIndexTool(IndexToolConstants):
             port=port,
             ssl=tls,
             ssl_ca_certs=tls_ca_file,
+            ssl_certfile=tls_client_file,
+            ssl_pem_passphrase=tls_pem_passphrase
             connect=True,
             connectTimeoutMS=DocumentDbIndexTool.CONNECT_TIMEOUT,
             serverSelectionTimeoutMS=DocumentDbIndexTool.CONNECT_TIMEOUT)
@@ -498,6 +500,8 @@ class DocumentDbIndexTool(IndexToolConstants):
                     port=self.args.port,
                     tls=self.args.tls,
                     tls_ca_file=self.args.tls_ca_file,
+                    tls_client_file=self.args.tls_client_file,
+                    ssl_pem_passphrase = self.args.tls_pem_passphrase,
                     username=self.args.username,
                     password=self.args.password,
                     auth_db=self.args.auth_db)
@@ -653,6 +657,16 @@ def main():
                         required=False,
                         type=str,
                         help='path to CA file used for TLS connection')
+
+    parser.add_argument('--tls-client-file',
+                        required=False,
+                        type=str,
+                        help='path to client certificate file used for TLS connection. Corresponds to driver "ssl_certfile" ')
+
+    parser.add_argument('--tls-pem-passphrase',
+                        required=False,
+                        type=str,
+                        help='Password to decrypt PEM file if tls-client-file requires a decryption password. Corresponds to driver "ssl_pem_passphrase"')
 
     args = parser.parse_args()
 
