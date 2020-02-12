@@ -19,12 +19,14 @@ import errno
 import json
 import logging
 import os
+import re
 import sys
 
 from bson.json_util import dumps
 from pymongo import MongoClient
 from pymongo.errors import (ConnectionFailure, OperationFailure,
                             ServerSelectionTimeoutError)
+import index_namer as namer
 
 
 class AutovivifyDict(dict):
@@ -52,7 +54,6 @@ class DocumentDbLimits(object):
     DATABASE_NAME_MAX_LENGTH = 63
     FULLY_QUALIFIED_INDEX_NAME_MAX_LENGTH = 127
     INDEX_KEY_MAX_LENGTH = 2048
-    INDEX_NAME_MAX_LENGTH = 63
     NAMESPACE_MAX_LENGTH = 120
 
 
@@ -67,8 +68,8 @@ class DocumentDbUnsupportedFeatures(object):
     UNSUPPORTED_INDEX_TYPES = [
         'text', '2d', '2dsphere', 'geoHaystack', 'hashed'
     ]
-    UNSUPPORTED_INDEX_OPTIONS = ['partialFilterExpression', 'storageEngine', \
-                                'collation', 'dropDuplicates']
+    UNSUPPORTED_INDEX_OPTIONS = ['partialFilterExpression', 'storageEngine',
+                                 'collation', 'dropDuplicates']
     UNSUPPORTED_COLLECTION_OPTIONS = ['capped']
 
 
@@ -80,10 +81,12 @@ class IndexToolConstants(object):
     def __init__(self):
         pass
 
-    DATABASES_TO_SKIP = ['admin', 'local', 'system']
+    DATABASES_TO_SKIP = ['admin', 'local', 'system', 'config']
+    COLLECTIONS_TO_SKIP = ['system.profile']
     METADATA_FILE_SUFFIX_PATTERN = 'metadata.json'
     CONNECT_TIMEOUT = 5000
     EXCEEDED_LIMITS = 'exceeded_limits'
+    CAN_REMEDY = 'can_remedy'
     FILE_PATH = 'filepath'
     ID = '_id_'
     INDEXES = 'indexes'
@@ -97,6 +100,8 @@ class IndexToolConstants(object):
     UNSUPPORTED_INDEX_OPTIONS_KEY = 'unsupported_index_options'
     UNSUPPORTED_COLLECTION_OPTIONS_KEY = 'unsupported_collection_options'
     UNSUPPORTED_INDEX_TYPES_KEY = 'unsupported_index_types'
+    INDEX_OPTIONS_SKIP_KEYS = [INDEX_KEY,
+                               INDEX_VERSION, INDEX_NAMESPACE]
 
 
 class DocumentDbIndexTool(IndexToolConstants):
@@ -141,8 +146,8 @@ class DocumentDbIndexTool(IndexToolConstants):
             port=port,
             ssl=tls,
             ssl_ca_certs=tls_ca_file,
-            ssl_certfile=tls_client_file,
-            ssl_pem_passphrase=tls_pem_passphrase
+            tlsCertificateKeyFile=tls_client_file,
+            tlsCertificateKeyFilePassword=tls_pem_passphrase,
             connect=True,
             connectTimeoutMS=DocumentDbIndexTool.CONNECT_TIMEOUT,
             serverSelectionTimeoutMS=DocumentDbIndexTool.CONNECT_TIMEOUT)
@@ -202,6 +207,9 @@ class DocumentDbIndexTool(IndexToolConstants):
                     "Malformed metadata document {} has no indexes.".format(
                         filepath))
 
+            if len(indexes) == 0:
+                raise Exception("Empti indexes list in {}".format(filepath))
+
             first_index = indexes[0]
             first_index_namespace = first_index[self.NAMESPACE]
             (db_name, collection_name) = first_index_namespace.split('.', 1)
@@ -222,7 +230,7 @@ class DocumentDbIndexTool(IndexToolConstants):
         """Recurse through subdirectories looking for metadata files"""
         metadata_files = []
 
-        for (dirpath, dirnames, files) in os.walk(start_dir):
+        for (dirpath, _, files) in os.walk(start_dir):
             for filename in files:
                 if filename.endswith(self.METADATA_FILE_SUFFIX_PATTERN):
                     metadata_files.append(os.path.join(dirpath, filename))
@@ -244,6 +252,8 @@ class DocumentDbIndexTool(IndexToolConstants):
                 logging.debug("Database: %s", database_name)
 
                 if database_name in self.DATABASES_TO_SKIP:
+                    logging.debug(
+                        "Skipping database '%s' internal database", database_name)
                     continue
 
                 database_path = os.path.join(output_dir, database_name)
@@ -255,6 +265,13 @@ class DocumentDbIndexTool(IndexToolConstants):
                 for collection_name in connection[
                         database_name].list_collection_names():
                     logging.debug("Collection: %s", collection_name)
+
+                    if 'system' in collection_name:
+                        # if collection_name in self.COLLECTIONS_TO_SKIP:
+                        logging.debug(
+                            "Skipping internal collection '%s'", collection_name)
+                        continue
+
                     collection_metadata = {}
                     collection_indexes = connection[database_name][
                         collection_name].list_indexes()
@@ -288,8 +305,9 @@ class DocumentDbIndexTool(IndexToolConstants):
                 "Completed writing index metadata to local folder: %s",
                 output_dir)
 
-        except Exception:
+        except Exception as exitEx:
             logging.exception("Failed to dump indexes from server")
+            logging.exception(exitEx)
             sys.exit()
 
     def get_metadata(self, start_path):
@@ -373,21 +391,24 @@ class DocumentDbIndexTool(IndexToolConstants):
                     index = collection_metadata[self.INDEXES][index_name]
 
                     # <collection>$<index>
-                    collection_qualified_index_name = '{}${}'.format(
-                        collection_name, index_name)
-                    if len(
-                            collection_qualified_index_name
-                    ) > DocumentDbLimits.COLLECTION_QUALIFIED_INDEX_NAME_MAX_LENGTH:
+
+                    if not namer.length_ok(collection_name, index_name):
                         message = '<collection>$<index> greater than {} characters'.format(
-                            DocumentDbLimits.
-                            COLLECTION_QUALIFIED_INDEX_NAME_MAX_LENGTH)
-                        compatibility_issues[db_name][collection_name][
-                            index_name][self.EXCEEDED_LIMITS][
-                                message] = collection_qualified_index_name
+                            namer.COLLECTION_QUALIFIED_INDEX_NAME_MAX_LENGTH)
+
+                        compatibility_issues[db_name][collection_name][index_name][self.EXCEEDED_LIMITS][
+                            message] = namer.fully_qualified_name(collection_name, index_name)
+
+                        shorter_name = namer.shorten(index_name)
+                        if namer.length_ok(collection_name, shorter_name):
+                            message = 'Rename index to {} will fix index length'.format(
+                                shorter_name)
+
+                            compatibility_issues[db_name][collection_name][index_name][self.CAN_REMEDY][
+                                message] = namer.fully_qualified_name(collection_name, index_name)
 
                     # <db>.<collection>$<index>
-                    fully_qualified_index_name = '{}${}'.format(
-                        collection_namespace, index_name)
+                    fully_qualified_index_name = '{}${}'.format(collection_namespace, index_name)
                     if len(
                             fully_qualified_index_name
                     ) > DocumentDbLimits.FULLY_QUALIFIED_INDEX_NAME_MAX_LENGTH:
@@ -447,8 +468,8 @@ class DocumentDbIndexTool(IndexToolConstants):
         """Restore compatible indexes to a DocumentDB instance"""
         for db_name in metadata:
             for collection_name in metadata[db_name]:
-                for index_name in metadata[db_name][collection_name][
-                        self.INDEXES]:
+                for index_name in metadata[db_name][collection_name][self.INDEXES]:
+
                     # convert the keys dict to a list of tuples as pymongo requires
                     index_keys = metadata[db_name][collection_name][
                         self.INDEXES][index_name][self.INDEX_KEY]
@@ -463,27 +484,31 @@ class DocumentDbIndexTool(IndexToolConstants):
 
                         keys_to_create.append((key, index_direction))
 
-                    for k in metadata[db_name][collection_name][
-                            self.INDEXES][index_name]:
-                        if k != self.INDEX_KEY and k != self.INDEX_VERSION:
+                    for k in metadata[db_name][collection_name][self.INDEXES][index_name]:
+                        if k not in self.INDEX_OPTIONS_SKIP_KEYS:
                             # this key is an additional index option
-                            index_options[k] = metadata[db_name][
-                                collection_name][self.INDEXES][index_name][k]
+                            index_options[k] = metadata[db_name][collection_name][self.INDEXES][index_name][k]
+
+                    index_options[self.INDEX_NAME] = namer.shorten_if_exceeds(
+                        collection_name, index_name)
+
+                    if not namer.length_ok(collection_name, index_name):
+                        logging.warning("Index name too long!!! %s", index_name)
 
                     if self.args.dry_run is True:
                         logging.info(
                             "(dry run) %s.%s: would attempt to add index: %s",
-                            db_name, collection_name, index_name)
+                            db_name, collection_name, index_options[self.INDEX_NAME])
 
                     else:
-                        logging.debug("Adding index %s -> %s", keys_to_create,
-                                      index_options)
+                        logging.debug("Adding index %s -> %s",
+                                      keys_to_create, index_options)
                         database = connection[db_name]
                         collection = database[collection_name]
-                        collection.create_index(keys_to_create,
-                                                **index_options)
+                        collection.create_index(
+                            keys_to_create, **index_options)
                         logging.info("%s.%s: added index: %s", db_name,
-                                     collection_name, index_name)
+                                     collection_name, index_options[self.INDEX_NAME])
 
     def run(self):
         """Entry point
@@ -501,7 +526,7 @@ class DocumentDbIndexTool(IndexToolConstants):
                     tls=self.args.tls,
                     tls_ca_file=self.args.tls_ca_file,
                     tls_client_file=self.args.tls_client_file,
-                    ssl_pem_passphrase = self.args.tls_pem_passphrase,
+                    tls_pem_passphrase=self.args.tls_pem_passphrase,
                     username=self.args.username,
                     password=self.args.password,
                     auth_db=self.args.auth_db)
@@ -536,10 +561,14 @@ class DocumentDbIndexTool(IndexToolConstants):
                     )
                     sys.exit()
             else:
-                metadata_to_restore = self._get_compatible_metadata(
-                    metadata, compatibility_issues)
+                # TODO: FIX!
+                # metadata_to_restore = self._get_compatible_metadata(metadata, compatibility_issues)
+                pass
 
-            self._restore_indexes(connection, metadata_to_restore)
+            # TODO: Fix!
+            # self._restore_indexes(connection, metadata_to_restore)
+            self._restore_indexes(connection, metadata)
+
             sys.exit()
 
         # find and print a summary or detail or compatibility issues
@@ -640,13 +669,12 @@ def main():
                         type=str,
                         help='authenticate with password PASSWORD')
 
-    parser.add_argument(
-        '--auth-db',
-        required=False,
-        type=str,
-        dest='auth_db',
-        default='admin',
-        help='authenticate using database AUTH_DB (default: admin)')
+    parser.add_argument('--auth-db',
+                        required=False,
+                        type=str,
+                        dest='auth_db',
+                        default='admin',
+                        help='authenticate using database AUTH_DB (default: admin)')
 
     parser.add_argument('--tls',
                         required=False,
@@ -665,6 +693,7 @@ def main():
 
     parser.add_argument('--tls-pem-passphrase',
                         required=False,
+                        dest='tls_pem_passphrase',
                         type=str,
                         help='Password to decrypt PEM file if tls-client-file requires a decryption password. Corresponds to driver "ssl_pem_passphrase"')
 
@@ -688,9 +717,6 @@ def main():
             parser.error(
                 "both --username amd --password are required if providing MongoDB credentials."
             )
-
-    if args.auth_db is not None and not all([args.username, args.password]):
-        parser.error("--auth-db requires both --username and --password.")
 
     indextool = DocumentDbIndexTool(args)
     indextool.run()
