@@ -23,6 +23,7 @@ import re
 import sys
 
 from bson.json_util import dumps
+import pymongo
 from pymongo import MongoClient
 from pymongo.errors import (ConnectionFailure, OperationFailure,
                             ServerSelectionTimeoutError)
@@ -392,23 +393,22 @@ class DocumentDbIndexTool(IndexToolConstants):
 
                     # <collection>$<index>
 
-                    if not namer.length_ok(collection_name, index_name):
-                        message = '<collection>$<index> greater than {} characters'.format(
-                            namer.COLLECTION_QUALIFIED_INDEX_NAME_MAX_LENGTH)
+                    if not namer.length_ok(collection_name, index_name) and self.args.allow_index_name_shortener  :
 
-                        compatibility_issues[db_name][collection_name][index_name][self.EXCEEDED_LIMITS][
-                            message] = namer.fully_qualified_name(collection_name, index_name)
-
+                        # long names can be fixed by applying shortened name.
                         shorter_name = namer.shorten(index_name)
-                        if namer.length_ok(collection_name, shorter_name):
-                            message = 'Rename index to {} will fix index length'.format(
-                                shorter_name)
 
-                            compatibility_issues[db_name][collection_name][index_name][self.CAN_REMEDY][
-                                message] = namer.fully_qualified_name(collection_name, index_name)
+                        if namer.length_ok(collection_name, shorter_name):
+                            logging.debug(
+                                f'Renaming index to {shorter_name} will fix index length')
+                        else:
+                            message = f'<collection>$<index> greater than {namer.COLLECTION_QUALIFIED_INDEX_NAME_MAX_LENGTH} characters'
+                            compatibility_issues[db_name][collection_name][index_name][self.EXCEEDED_LIMITS][message] = namer.fully_qualified_name(
+                                collection_name, index_name)
 
                     # <db>.<collection>$<index>
-                    fully_qualified_index_name = '{}${}'.format(collection_namespace, index_name)
+                    fully_qualified_index_name = '{}${}'.format(
+                        collection_namespace, index_name)
                     if len(
                             fully_qualified_index_name
                     ) > DocumentDbLimits.FULLY_QUALIFIED_INDEX_NAME_MAX_LENGTH:
@@ -469,6 +469,8 @@ class DocumentDbIndexTool(IndexToolConstants):
         for db_name in metadata:
             for collection_name in metadata[db_name]:
                 for index_name in metadata[db_name][collection_name][self.INDEXES]:
+                    # Skip creation of _id index.
+                    if index_name == self.ID : continue
 
                     # convert the keys dict to a list of tuples as pymongo requires
                     index_keys = metadata[db_name][collection_name][
@@ -493,12 +495,12 @@ class DocumentDbIndexTool(IndexToolConstants):
                         collection_name, index_name)
 
                     if not namer.length_ok(collection_name, index_name):
-                        logging.warning("Index name too long!!! %s", index_name)
+                        logging.warning(
+                            "Index name too long!!! %s", index_name)
 
                     if self.args.dry_run is True:
                         logging.info(
-                            "(dry run) %s.%s: would attempt to add index: %s",
-                            db_name, collection_name, index_options[self.INDEX_NAME])
+                            f'(dry run) {db_name}.{collection_name}: would attempt to add index:{index_options[self.INDEX_NAME]}')
 
                     else:
                         logging.debug("Adding index %s -> %s",
@@ -516,6 +518,8 @@ class DocumentDbIndexTool(IndexToolConstants):
         metadata = None
         compatibility_issues = None
         connection = None
+
+        logging.info(f'Using PyMongo version {pymongo.version}')
 
         # get a connection to our source mongodb or destination DocumentDb
         if self.args.dump_indexes is True or self.args.restore_indexes is True:
@@ -561,13 +565,10 @@ class DocumentDbIndexTool(IndexToolConstants):
                     )
                     sys.exit()
             else:
-                # TODO: FIX!
-                # metadata_to_restore = self._get_compatible_metadata(metadata, compatibility_issues)
+                metadata_to_restore = self._get_compatible_metadata(metadata, compatibility_issues)
                 pass
 
-            # TODO: Fix!
-            # self._restore_indexes(connection, metadata_to_restore)
-            self._restore_indexes(connection, metadata)
+            self._restore_indexes(connection, metadata_to_restore)
 
             sys.exit()
 
@@ -696,6 +697,12 @@ def main():
                         dest='tls_pem_passphrase',
                         type=str,
                         help='Password to decrypt PEM file if tls-client-file requires a decryption password. Corresponds to driver "ssl_pem_passphrase"')
+
+    parser.add_argument('--allow-index-name-shortener',
+                        required=False,
+                        type=bool,
+                        default=True,
+                        help='When enabled, shortens names of indexes that violate index name limits')
 
     args = parser.parse_args()
 
